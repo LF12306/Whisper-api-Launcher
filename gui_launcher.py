@@ -1,365 +1,382 @@
-import sys
+"""Multi-model launcher using the original Whisper launcher's Tk interface."""
+import ctypes
+import json
 import os
+from pathlib import Path
+import queue
+import shutil
+import socket
 import subprocess
+import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox
-import ctypes
-import webbrowser
+from tkinter import filedialog, messagebox, scrolledtext
 import urllib.request
-import json
+import webbrowser
+
+ROOT = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+CONFIG = ROOT / "launcher_config.json"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-# === PyInstaller 内置资源路径解析函数 ===
 def get_resource_path(relative_path):
-    """ 获取资源的绝对路径 (兼容开发环境和 PyInstaller 打包后的环境) """
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    return str(Path(getattr(sys, "_MEIPASS", ROOT)) / relative_path)
 
-# === 核心工具：获取 8.3 短路径 (防闪退神器) ===
-def get_short_path(long_path):
-    if not os.path.exists(long_path): return long_path
-    buf_size = 256
-    buf = ctypes.create_unicode_buffer(buf_size)
-    GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
-    ret = GetShortPathNameW(long_path, buf, buf_size)
-    if ret > buf_size:
-        buf = ctypes.create_unicode_buffer(ret)
-        ret = GetShortPathNameW(long_path, buf, ret)
-    return buf.value if ret > 0 else long_path
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return default
+
+
+def default_config():
+    old = read_json(ROOT / "models.json", {})
+    cuda = False
+    try:
+        ctypes.WinDLL("nvcuda.dll")
+        cuda = True
+    except (OSError, AttributeError):
+        pass
+    return dict(engine="qwen3-1.7b", port=8086, auto_start=False,
+                whisper_exe=old.get("exe_path", str(ROOT / "bin" / ("cuda" if cuda else "cpu") / "whisper-server.exe")),
+                whisper_model=old.get("model_path", str(ROOT / "models" / "ggml-large-v3.bin")))
+
+
+def build_command(config, catalog):
+    port = int(config["port"])
+    if not 1 <= port <= 65535:
+        raise ValueError("端口需要在 1 到 65535 之间。")
+    if config["engine"] == "whisper":
+        exe, model = Path(config["whisper_exe"]).resolve(), Path(config["whisper_model"]).resolve()
+        if not exe.is_file() or not model.is_file():
+            raise ValueError("找不到 Whisper 程序或模型，请重新选择。")
+        try:
+            model_arg = os.path.relpath(model, exe.parent)
+        except ValueError:
+            model_arg = str(model)
+        if not model_arg.isascii():
+            buf = ctypes.create_unicode_buffer(32768)
+            if ctypes.windll.kernel32.GetShortPathNameW(str(model), buf, len(buf)):
+                model_arg = buf.value
+            if not model_arg.isascii():
+                raise ValueError("旧版 Whisper 引擎需要英文模型参数路径，请选择启动器内 models 文件夹中的模型。")
+        return [str(exe), "-m", model_arg, "--port", str(port), "--host", "127.0.0.1",
+                "--inference-path", "/v1/audio/transcriptions"], exe.parent
+    python = ROOT / ".venv" / "Scripts" / "python.exe"
+    if not python.exists() or not (ROOT / ".runtime" / "backend-ready.txt").exists():
+        raise ValueError("请先点击“准备模型”，首次准备需要下载数 GB 文件。")
+    entry = catalog[config["engine"]]
+    model = ROOT / "models" / entry["directory"]
+    aligner = ROOT / "models" / catalog["aligner"]["directory"]
+    if not (model / "config.json").is_file() or not (aligner / "config.json").is_file():
+        raise ValueError("所选模型尚未下载，请先点击“准备模型”。")
+    ffmpeg = str(ROOT / "bin" / "ffmpeg.exe") if (ROOT / "bin" / "ffmpeg.exe").exists() else shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ValueError("找不到 FFmpeg，请将 ffmpeg.exe 放到 bin 文件夹。")
+    command = [str(python), str(ROOT / "asr_server.py"), "--model", str(model), "--aligner", str(aligner),
+               "--port", str(port), "--ffmpeg", ffmpeg]
+    return command, ROOT
+
 
 class Application(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Whisper 启动器（又名：这群人在唱or念什么东西）")
-        self.geometry("720x680") # 稍微调高了一点窗口以放下新选项
-
-        # === 加载内嵌的窗口图标 ===
+        self.geometry("720x680")
         icon_path = get_resource_path("栞子.ico")
         if os.path.exists(icon_path):
             self.iconbitmap(icon_path)
+        self.catalog = read_json(ROOT / "model_catalog.json", {})
+        if not all(key in self.catalog for key in ("qwen3-1.7b", "qwen3-0.6b", "aligner")):
+            messagebox.showerror("文件缺失", "请将启动器与 model_catalog.json 等配套文件放在同一文件夹。")
+            self.destroy()
+            return
+        self.config = default_config()
+        self.config.update(read_json(CONFIG, {}))
+        self.process = None
+        self.mode = None
+        self.events = queue.Queue()
+        self.closing = False
+        self.ready = False
+        self.labels = {k: self.catalog[k]["label"] for k in ("qwen3-1.7b", "qwen3-0.6b")}
+        self.labels["whisper"] = "Whisper（原有 whisper.cpp 引擎）"
+        if self.config["engine"] not in self.labels:
+            self.config["engine"] = "qwen3-1.7b"
+        self.engine = tk.StringVar(value=self.labels[self.config["engine"]])
+        self.port = tk.StringVar(value=str(self.config["port"]))
+        self.auto_start = tk.BooleanVar(value=self.config["auto_start"])
+        self.whisper_exe = tk.StringVar(value=self.config["whisper_exe"])
+        self.whisper_model = tk.StringVar(value=self.config["whisper_model"])
+        self.exe_path_var = tk.StringVar(value=self.whisper_exe.get())
+        self.model_path_var = tk.StringVar(value=self.whisper_model.get())
+        self._display_engine = None
+        self.controls = []
 
-        # === 确定配置文件的保存路径 ===
-        if getattr(sys, 'frozen', False):
-            base_path = os.path.dirname(sys.executable)
-        else:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        self.config_file = os.path.join(base_path, "models.json")
-
-        self.process = None 
-        self.is_running = False
-        self.check_timer = None
-        
-        # 自动查找路径
-        base_dir = os.getcwd()
-        self.default_model = os.path.join(base_dir, "models", "ggml-large-v3.bin")
-        
-        # === 新增：环境探测与分支切换 ===
-        bin_dir = os.path.join(base_dir, "bin")
-        
-        # 探测 CUDA
-        self.has_cuda = self.check_cuda_available()
-        
-        
-        if self.has_cuda:
-            # 环境支持 CUDA，指向 cuda 文件夹
-            target_exe = os.path.join(bin_dir, "cuda", "whisper-server.exe")
-            fallback_target = os.path.join(bin_dir, "whisper-server.exe") # 兼容旧版结构
-        else:
-            # 环境不支持，指向 cpu 文件夹
-            target_exe = os.path.join(bin_dir, "cpu", "whisper-server.exe")
-            fallback_target = target_exe # 如果没有cuda，就死磕cpu版
-        
-        # 验证文件是否存在
-        if os.path.exists(target_exe):
-            self.server_exe = target_exe
-        elif os.path.exists(fallback_target):
-            self.server_exe = fallback_target
-        else:
-            self.server_exe = "" # 让用户自己选
-
-        
-
-        # --- 界面布局 ---
-        # 1. 配置区
+        # Preserve the original layout, colors, fonts, title, and window size.
         config_frame = tk.LabelFrame(self, text="基础配置")
         config_frame.pack(pady=10, padx=10, fill="x")
-        
-        tk.Label(config_frame, text="Server程序:").grid(row=0, column=0, sticky="w", padx=5)
-        self.exe_path_var = tk.StringVar(value=self.server_exe)
-        tk.Entry(config_frame, textvariable=self.exe_path_var, width=60).grid(row=0, column=1, padx=5)
-        tk.Button(config_frame, text="...", command=lambda: self.browse_file(self.exe_path_var, "exe")).grid(row=0, column=2)
-
-        tk.Label(config_frame, text="模型路径:").grid(row=1, column=0, sticky="w", padx=5)
-        self.model_path_var = tk.StringVar(value=self.default_model)
-        tk.Entry(config_frame, textvariable=self.model_path_var, width=60).grid(row=1, column=1, padx=5)
-        tk.Button(config_frame, text="...", command=lambda: self.browse_file(self.model_path_var, "bin")).grid(row=1, column=2)
-
+        self.path_controls = []
+        for row, label, variable, pattern in [(0, "Server程序:", self.exe_path_var, "*.exe"),
+                                              (1, "模型路径:", self.model_path_var, "*.bin")]:
+            tk.Label(config_frame, text=label).grid(row=row, column=0, sticky="w", padx=5)
+            entry = tk.Entry(config_frame, textvariable=variable, width=60)
+            entry.grid(row=row, column=1, padx=5)
+            button = tk.Button(config_frame, text="...", command=lambda v=variable, p=pattern: self.browse(v, p))
+            button.grid(row=row, column=2)
+            self.path_controls.extend([entry, button])
         tk.Label(config_frame, text="端口 (Port):").grid(row=2, column=0, sticky="w", padx=5)
-        self.port_var = tk.IntVar(value=8080)
-        tk.Entry(config_frame, textvariable=self.port_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        port_entry = tk.Entry(config_frame, textvariable=self.port, width=10)
+        port_entry.grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        tk.Checkbutton(config_frame, text="打开程序时自动启动服务", variable=self.auto_start).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
 
-        # === 新增：自动启动选项 ===
-        self.auto_start_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(config_frame, text="打开程序时自动启动服务", variable=self.auto_start_var).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        # Only the controls needed by the new models are added below the old fields.
+        tk.Label(config_frame, text="识别模型:").grid(row=4, column=0, sticky="w", padx=5)
+        model_box = tk.OptionMenu(config_frame, self.engine, *self.labels.values(), command=self.engine_changed)
+        model_box.configure(width=39, anchor="w")
+        model_box.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+        self.prepare = tk.Button(config_frame, text="准备模型", command=self.prepare_backend)
+        self.prepare.grid(row=4, column=2, padx=(0, 5))
+        self.controls.extend([model_box, port_entry])
+        self.port.trace_add("write", lambda *_: self.update_url())
 
-        # === 初始化时加载上次的配置 ===
-        self.load_config()
-
-        # 2. 控制区
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=10)
-        
-        self.btn_start = tk.Button(btn_frame, text="启动服务", command=self.toggle_server, 
-                                 bg="#e1f5fe", font=("微软雅黑", 14, "bold"), width=15, height=2)
-        self.btn_start.pack(side="left", padx=10)
-
-        self.btn_test = tk.Button(btn_frame, text="打开网页测试", command=self.open_test_page,
-                                state="disabled", font=("微软雅黑", 10))
-        self.btn_test.pack(side="left", padx=10)
-        
-        self.status_var = tk.StringVar(value="状态: 已停止")
-        self.status_label = tk.Label(self, textvariable=self.status_var, fg="#555", font=("微软雅黑", 10, "bold"))
+        self.start = tk.Button(btn_frame, text="启动服务", command=self.toggle_server,
+                               bg="#e1f5fe", font=("微软雅黑", 14, "bold"), width=15, height=2)
+        self.start.pack(side="left", padx=10)
+        self.test = tk.Button(btn_frame, text="打开网页测试", command=self.open_test,
+                              state="disabled", font=("微软雅黑", 10))
+        self.test.pack(side="left", padx=10)
+        self.status = tk.StringVar(value="状态: 已停止")
+        self.status_label = tk.Label(self, textvariable=self.status, fg="#555", font=("微软雅黑", 10, "bold"))
         self.status_label.pack(pady=5)
 
-        # 3. 关键说明区 (OpenAI 地址)
         info_frame = tk.Frame(self, bg="#e8f5e9", borderwidth=1, relief="solid")
         info_frame.pack(fill="x", padx=10, pady=5)
-        
-        tk.Label(info_frame, text="✅ 兼容模式已开启，请复制下方地址到打轴软件：", 
+        tk.Label(info_frame, text="✅ 兼容模式已开启，请复制下方地址到打轴软件：",
                  bg="#e8f5e9", fg="#1b5e20").pack(pady=2)
-        
-        self.url_label = tk.Entry(info_frame, font=("Consolas", 11, "bold"), fg="#2e7d32", bg="#e8f5e9", justify="center", bd=0)
-        self.url_label.insert(0, f"http://127.0.0.1:{self.port_var.get()}/v1")
+        self.url = tk.StringVar()
+        self.url_label = tk.Entry(info_frame, textvariable=self.url, state="readonly", font=("Consolas", 11, "bold"),
+                                  fg="#2e7d32", bg="#e8f5e9", justify="center", bd=0)
         self.url_label.pack(fill="x", padx=20, pady=5)
-        self.url_label.configure(state="readonly")
 
-        # 4. 日志
         log_frame = tk.LabelFrame(self, text="运行日志")
         log_frame.pack(pady=5, padx=10, fill="both", expand=True)
-        self.log_area = scrolledtext.ScrolledText(log_frame, state='disabled', height=10, font=("Consolas", 9))
+        self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", height=10, font=("Consolas", 9))
         self.log_area.pack(fill="both", expand=True)
-
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.engine_changed()
+        self.update_url()
+        self.after(100, self.pump)
+        if self.auto_start.get():
+            self.after(600, self.toggle_server)
 
-        # === 新增：触发自动启动逻辑 ===
-        if self.auto_start_var.get():
-            # 延时 500ms 启动，确保 UI 已经完全渲染出来
-            self.after(500, self.auto_start_sequence)
+    def selected_engine(self):
+        return next(k for k, label in self.labels.items() if label == self.engine.get())
 
-
-
-    def check_cuda_available(self):
-        """静默检测系统是否存在 nvcuda.dll"""
-        try:
-            # 尝试加载 CUDA 驱动核心 DLL
-            ctypes.windll.LoadLibrary("nvcuda.dll")
-            return True
-        except OSError:
-            # 找不到 DLL 或加载失败
-            return False
-
-
-    def auto_start_sequence(self):
-        """ 执行自动启动前检查路径是否有效 """
-        exe = self.exe_path_var.get()
-        model = self.model_path_var.get()
-        if os.path.exists(exe) and os.path.exists(model):
-            self.log("[系统] 检测到自动启动已勾选，正在拉起服务...\n")
-            self.toggle_server()
+    def engine_changed(self, _event=None):
+        if self._display_engine == "whisper":
+            self.whisper_exe.set(self.exe_path_var.get())
+            self.whisper_model.set(self.model_path_var.get())
+        key = self.selected_engine()
+        if key == "whisper":
+            self.exe_path_var.set(self.whisper_exe.get())
+            self.model_path_var.set(self.whisper_model.get())
         else:
-            self.log("[系统] 自动启动取消：找不到 exe 或模型文件，请检查路径是否正确。\n")
+            self.exe_path_var.set(str(ROOT / ".venv" / "Scripts" / "python.exe"))
+            self.model_path_var.set(str(ROOT / "models" / self.catalog[key]["directory"]))
+        self._display_engine = key
+        self.set_controls(self.process is None)
 
-    # === 读取 JSON 配置 ===
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    if "exe_path" in config and os.path.exists(config["exe_path"]):
-                        self.exe_path_var.set(config["exe_path"])
-                    if "model_path" in config and os.path.exists(config["model_path"]):
-                        self.model_path_var.set(config["model_path"])
-                    if "port" in config:
-                        self.port_var.set(config["port"])
-                    # 读取自动启动状态
-                    if "auto_start" in config:
-                        self.auto_start_var.set(config["auto_start"])
-            except Exception as e:
-                print(f"读取配置文件失败: {e}")
+    def update_url(self):
+        if hasattr(self, "url"):
+            self.url.set(f"http://127.0.0.1:{self.port.get()}/v1")
 
-    # === 保存 JSON 配置 ===
+    def current_config(self):
+        if self.selected_engine() == "whisper":
+            self.whisper_exe.set(self.exe_path_var.get())
+            self.whisper_model.set(self.model_path_var.get())
+        return dict(engine=self.selected_engine(), port=int(self.port.get()), auto_start=self.auto_start.get(),
+                    whisper_exe=self.whisper_exe.get(), whisper_model=self.whisper_model.get())
+
     def save_config(self):
-        config = {
-            "exe_path": self.exe_path_var.get(),
-            "model_path": self.model_path_var.get(),
-            "port": self.port_var.get(),
-            "auto_start": self.auto_start_var.get() # 保存自动启动状态
-        }
-        try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"保存配置文件失败: {e}")
+        data = self.current_config()
+        temporary = CONFIG.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(CONFIG)
 
-    def browse_file(self, var, type_):
-        ft = [("Executable", "*.exe")] if type_ == "exe" else [("GGML Model", "*.bin"), ("All Files", "*.*")]
-        f = filedialog.askopenfilename(filetypes=ft)
-        if f: var.set(f)
+    def browse(self, variable, pattern):
+        path = filedialog.askopenfilename(filetypes=[("所需文件", pattern), ("所有文件", "*.*")])
+        if path:
+            variable.set(path)
 
     def log(self, text):
         self.log_area.configure(state="normal")
         self.log_area.insert("end", text)
+        if int(self.log_area.index("end-1c").split(".")[0]) > 5000:
+            self.log_area.delete("1.0", "1000.0")
         self.log_area.see("end")
         self.log_area.configure(state="disabled")
 
-    def monitor_server(self):
-        """ 检测服务存活 """
-        if not self.is_running: return
-        port = self.port_var.get()
-        url = f"http://127.0.0.1:{port}/" 
+    def set_controls(self, enabled):
+        whisper_enabled = enabled and self.selected_engine() == "whisper"
+        for widget in self.controls:
+            widget.configure(state="normal" if enabled else "disabled")
+        for widget in self.path_controls:
+            if isinstance(widget, tk.Entry):
+                widget.configure(state="normal" if whisper_enabled else "readonly" if enabled else "disabled")
+            else:
+                widget.configure(state="normal" if whisper_enabled else "disabled")
+        self.prepare.configure(state="normal" if enabled and self.selected_engine() != "whisper" else "disabled")
+
+    def launch(self, command, cwd, mode):
+        env = os.environ.copy()
+        env.update(PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        setup_log = None
+        if mode == "setup" and getattr(sys, "frozen", False):
+            setup_log = ROOT / ".runtime" / "setup-output.log"
+            setup_log.parent.mkdir(exist_ok=True)
+            setup_log.write_text("", encoding="utf-8")
+        proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+        self.process, self.mode, self.ready = proc, mode, False
+        self.set_controls(False)
+        self.test.configure(state="disabled")
+        self.start.configure(text="停止准备" if mode == "setup" else "停止启动", bg="#ffe0b2")
+        self.status_label.configure(fg="orange")
+        self.status.set("状态: 正在准备环境及模型…" if mode == "setup" else "状态: 🚀 正在启动 (加载 OpenAI 兼容模式)...")
+
+        def read_output():
+            if setup_log:
+                with setup_log.open(encoding="utf-8", errors="replace") as stream:
+                    while True:
+                        line = stream.readline()
+                        if line:
+                            self.events.put(("log", line))
+                        elif proc.poll() is not None:
+                            break
+                        else:
+                            threading.Event().wait(0.1)
+            else:
+                for line in iter(proc.stdout.readline, b""):
+                    self.events.put(("log", line.decode("utf-8", errors="replace")))
+            proc.stdout.close()
+            self.events.put(("exit", proc, proc.wait()))
+
+        threading.Thread(target=read_output, daemon=True).start()
+        if mode == "server":
+            port, engine = self.port.get(), self.selected_engine()
+
+            def check_health():
+                url = f"http://127.0.0.1:{port}/" + ("health" if engine != "whisper" else "")
+                while proc.poll() is None:
+                    try:
+                        with urllib.request.urlopen(url, timeout=1) as response:
+                            if response.status == 200:
+                                self.events.put(("ready", proc))
+                                return
+                    except OSError:
+                        pass
+                    threading.Event().wait(1)
+
+            threading.Thread(target=check_health, daemon=True).start()
+
+    def prepare_backend(self):
+        if self.process:
+            return
         try:
-            with urllib.request.urlopen(url, timeout=0.5) as response:
-                if response.status == 200:
-                    self.after(0, self.set_running_ui)
-        except:
-            pass
-        if self.is_running:
-            self.check_timer = self.after(1000, self.monitor_server)
-
-    def read_output(self):
-        while self.process and self.process.poll() is None:
-            try:
-                line = self.process.stdout.readline()
-                if not line: break
-                try: text = line.decode("utf-8")
-                except: text = line.decode("mbcs", errors="ignore")
-                self.after(0, lambda t=text: self.log(t))
-            except: break
-        
-        self.is_running = False
-        code = self.process.poll() if self.process else -1
-        self.after(0, lambda: self.set_stopped(code))
-
-    def set_loading(self):
-        self.status_var.set("状态: 🚀 正在启动 (加载 OpenAI 兼容模式)...")
-        self.status_label.config(fg="orange")
-        self.btn_start.config(text="启动中...", state="disabled", bg="#ffe0b2")
-        self.btn_test.config(state="disabled")
-
-    def set_running_ui(self):
-        port = self.port_var.get()
-        self.status_var.set(f"状态: ✅ 服务运行中 (OpenAI Ready)")
-        self.status_label.config(fg="green")
-        self.btn_start.config(text="停止服务", state="normal", bg="#ffcdd2")
-        self.btn_test.config(state="normal")
-        
-        self.url_label.configure(state="normal")
-        self.url_label.delete(0, "end")
-        self.url_label.insert(0, f"http://127.0.0.1:{port}/v1")
-        self.url_label.configure(state="readonly")
-
-    def set_stopped(self, code):
-        if self.check_timer:
-            self.after_cancel(self.check_timer)
-            self.check_timer = None
-        msg = f"状态: ⛔ 已停止 (代码 {code})" if code else "状态: ⛔ 已停止"
-        self.status_var.set(msg)
-        self.status_label.config(fg="red")
-        self.btn_start.config(text="启动服务", state="normal", bg="#e1f5fe")
-        self.btn_test.config(state="disabled")
-
-    def open_test_page(self):
-        port = self.port_var.get()
-        webbrowser.open(f"http://127.0.0.1:{port}")
+            self.save_config()
+            if getattr(sys, "frozen", False):
+                command = [sys.executable, "--setup-backend", self.selected_engine()]
+            else:
+                command = [sys.executable, str(ROOT / "runtime_setup.py"), "--root", str(ROOT), "--model", self.selected_engine()]
+            self.launch(command, ROOT, "setup")
+        except Exception as error:
+            messagebox.showerror("准备失败", str(error))
 
     def toggle_server(self):
-            if self.is_running:
-                self.is_running = False
-                if self.process: self.process.terminate()
-                return
+        if self.process:
+            self.stop_process()
+            return
+        try:
+            config = self.current_config()
+            command, cwd = build_command(config, self.catalog)
+            with socket.socket() as check:
+                if check.connect_ex(("127.0.0.1", config["port"])) == 0:
+                    raise ValueError(f"端口 {config['port']} 已被其他服务占用。请选择另一个端口，例如 {config['port'] + 1}。")
+            self.save_config()
+            self.launch(command, cwd, "server")
+        except Exception as error:
+            messagebox.showerror("无法启动", str(error))
 
-            exe_abs = self.exe_path_var.get()
-            model_abs = self.model_path_var.get()
-            port = self.port_var.get()
+    def stop_process(self):
+        proc = self.process
+        if proc and proc.poll() is None:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW)
+            else:
+                proc.terminate()
 
-            if not os.path.exists(exe_abs): 
-                return messagebox.showerror("错误", "找不到 Server 程序文件！")
-            if not os.path.exists(model_abs):
-                return messagebox.showerror("错误", "找不到模型文件！")
-
-            # ================= 核心修复逻辑 =================
-            exe_dir = os.path.dirname(exe_abs)
-            
-            # 1. 尝试获取模型相对于 exe 的相对路径
+    def pump(self):
+        for _ in range(200):
             try:
-                model_arg = os.path.relpath(model_abs, start=exe_dir)
-            except ValueError:
-                # 如果在不同盘符（比如 exe 在 C 盘，model 在 D 盘），无法生成相对路径
-                model_arg = model_abs
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if event[0] == "log":
+                self.log(event[1])
+            elif event[0] == "ready" and event[1] is self.process and self.process.poll() is None:
+                self.ready = True
+                self.status.set("状态: ✅ 服务运行中 (OpenAI Ready)")
+                self.status_label.configure(fg="green")
+                self.start.configure(text="停止服务", bg="#ffcdd2")
+                self.test.configure(state="normal")
+            elif event[0] == "exit" and event[1] is self.process:
+                mode, code = self.mode, event[2]
+                self.process, self.mode, self.ready = None, None, False
+                self.set_controls(True)
+                self.start.configure(text="启动服务", bg="#e1f5fe")
+                self.status_label.configure(fg="red")
+                self.test.configure(state="disabled")
+                self.status.set("状态: 准备完成，请点击启动服务" if mode == "setup" and code == 0 else
+                                f"状态: ⛔ 已停止 (代码 {code})" if code else "状态: ⛔ 已停止")
+        if not self.closing:
+            self.after(100, self.pump)
 
-            # 2. 检查最终传给 whisper 的路径字符串中是否还包含非 ASCII 字符（中文等）
-            def has_non_ascii(text):
-                return any(ord(c) > 127 for c in text)
+    def copy_url(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.url.get())
 
-            if has_non_ascii(model_arg):
-                # 如果此时还有中文，说明相对路径法也救不了（比如用户自己从外面选了个带中文的模型路径）
-                # 直接弹窗拦截，防止小白面对闪退一脸懵逼
-                messagebox.showerror(
-                    "路径错误 (防闪退拦截)",
-                    f"检测到模型路径参数包含中文字符：\n{model_arg}\n\n"
-                    f"AI 引擎底层不支持中文路径，强行启动会直接闪退！\n\n"
-                    f"👉 【小白专用解决方法】\n"
-                    f"1. 请把整个软件文件夹移动到纯英文路径下（例如 D:\\WhisperTool\\ ）\n"
-                    f"2. 如果你的电脑用户名是中文（放桌面就会报错），请直接剪切到 D 盘或 E 盘根目录！"
-                )
-                self.log("[系统] 启动已拦截：路径中包含引擎不支持的中文字符。\n")
-                return
-            # ================================================
-
-            # 注意：cmd 第一个参数依然用绝对路径启动 exe，但 -m 参数传纯英文的相对路径
-            cmd = [
-                exe_abs, 
-                "-m", model_arg, 
-                "--port", str(port), 
-                "--host", "127.0.0.1",
-                "--inference-path", "/v1/audio/transcriptions"
-            ]
-
-            self.log(f"[系统] 执行命令: {' '.join(cmd)}\n")
-            self.log(f"[系统] 工作目录(cwd): {exe_dir}\n") # 打印出来方便你调试
-
-            try:
-                env = os.environ.copy()
-                env["PYTHONUNBUFFERED"] = "1"
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=exe_dir,  # <--- 极其关键：将底层工作目录指定为 exe 所在的目录
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    startupinfo=startupinfo,
-                    env=env,
-                    bufsize=0
-                )
-                self.is_running = True
-                self.set_loading()
-                threading.Thread(target=self.read_output, daemon=True).start()
-                self.monitor_server()
-                
-            except Exception as e:
-                messagebox.showerror("启动异常", str(e))
+    def open_test(self):
+        webbrowser.open(f"http://127.0.0.1:{self.port.get()}/")
 
     def on_closing(self):
-        # 退出前自动保存配置
-        self.save_config()
-        self.is_running = False
-        if self.process: self.process.kill()
+        try:
+            self.save_config()
+        except (OSError, ValueError):
+            pass
+        self.closing = True
+        self.stop_process()
         self.destroy()
 
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--setup-backend":
+        if getattr(sys, "frozen", False):
+            (ROOT / ".runtime").mkdir(exist_ok=True)
+            sys.stdout = sys.stderr = (ROOT / ".runtime" / "setup-output.log").open("a", encoding="utf-8", buffering=1)
+        from runtime_setup import setup
+        try:
+            setup(ROOT, sys.argv[2])
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    else:
+        Application().mainloop()
+
+
 if __name__ == "__main__":
-    app = Application()
-    app.mainloop()
+    main()

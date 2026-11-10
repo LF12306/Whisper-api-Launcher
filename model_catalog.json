@@ -1,0 +1,21 @@
+{
+  "qwen3-1.7b": {
+    "label": "Qwen3-ASR 1.7B（推荐，质量优先）",
+    "repo": "Qwen/Qwen3-ASR-1.7B",
+    "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+    "directory": "Qwen3-ASR-1.7B",
+    "description": "支持日语、中文等 30 种语言；配合 ForcedAligner 输出词级时间戳。"
+  },
+  "qwen3-0.6b": {
+    "label": "Qwen3-ASR 0.6B（轻量，速度优先）",
+    "repo": "Qwen/Qwen3-ASR-0.6B",
+    "revision": "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
+    "directory": "Qwen3-ASR-0.6B",
+    "description": "占用更低；准确率依素材而变，官方整体评测低于 1.7B。"
+  },
+  "aligner": {
+    "repo": "Qwen/Qwen3-ForcedAligner-0.6B",
+    "revision": "c7cbfc2048c462b0d63a45797104fc9db3ad62b7",
+    "directory": "Qwen3-ForcedAligner-0.6B"
+  }
+}

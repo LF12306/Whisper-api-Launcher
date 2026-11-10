@@ -1,0 +1,5 @@
+# CUDA torch/torchaudio are installed separately by runtime_setup.py.
+qwen-asr==0.0.6
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+python-multipart>=0.0.20,<1
